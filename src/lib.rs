@@ -5,7 +5,8 @@ use std::io::Read;
 #[derive(Debug, Clone)]
 pub struct DictEntry {
     pub surface: String,
-    pub pair_id: u16,
+    pub left_id: u16,
+    pub right_id: u16,
     pub word_cost: i16,
     pub reading: String,
 }
@@ -15,6 +16,7 @@ pub struct Dictionary {
     pub entries: Vec<DictEntry>,
     index: HashMap<char, Vec<usize>>,
     matrix: Vec<i16>,
+    max_left: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -27,8 +29,9 @@ struct LatticeNode {
 }
 
 impl Dictionary {
-    fn get_matrix_cost(&self, _prev_pair_id: u16, curr_pair_id: u16) -> i16 {
-        self.matrix.get(curr_pair_id as usize).copied().unwrap_or(0)
+    fn get_matrix_cost(&self, prev_right_id: u16, curr_left_id: u16) -> i16 {
+        let idx = (prev_right_id as usize) * self.max_left + (curr_left_id as usize);
+        self.matrix.get(idx).copied().unwrap_or(0)
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
@@ -36,7 +39,7 @@ impl Dictionary {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        if buffer.len() < 16 {
+        if buffer.len() < 18 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "File too small",
@@ -51,59 +54,47 @@ impl Dictionary {
         }
 
         let _version = u16::from_le_bytes([buffer[4], buffer[5]]);
-        let num_matrix = u16::from_le_bytes([buffer[6], buffer[7]]) as usize;
-        let num_entries =
-            u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]) as usize;
-        let index_offset =
-            u32::from_le_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]) as usize;
+        let max_left = u16::from_le_bytes([buffer[6], buffer[7]]) as usize;
+        let max_right = u16::from_le_bytes([buffer[8], buffer[9]]) as usize;
+        let num_entries = u32::from_le_bytes([buffer[10], buffer[11], buffer[12], buffer[13]]) as usize;
+        let index_offset = u32::from_le_bytes([buffer[14], buffer[15], buffer[16], buffer[17]]) as usize;
 
-        if buffer.len() < 20 {
+        if buffer.len() < 22 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Header too small",
             ));
         }
-        let strings_offset =
-            u32::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]) as usize;
+        let strings_offset = u32::from_le_bytes([buffer[18], buffer[19], buffer[20], buffer[21]]) as usize;
 
-        let mut matrix = vec![0i16; num_matrix];
-        let mut pos = 20;
-        for _ in 0..num_matrix {
-            let pair_id = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]) as usize;
-            let cost = i16::from_le_bytes([buffer[pos + 2], buffer[pos + 3]]);
-            if pair_id < matrix.len() {
-                matrix[pair_id] = cost;
+        let matrix_size = max_left * max_right;
+        let mut matrix = vec![0i16; matrix_size];
+        let mut pos = 22;
+        for i in 0..matrix_size {
+            if pos + 2 > buffer.len() {
+                break;
             }
-            pos += 4;
+            matrix[i] = i16::from_le_bytes([buffer[pos], buffer[pos + 1]]);
+            pos += 2;
         }
 
         let mut entries = Vec::with_capacity(num_entries);
         for _ in 0..num_entries {
-            let surf_off = u32::from_le_bytes([
-                buffer[pos],
-                buffer[pos + 1],
-                buffer[pos + 2],
-                buffer[pos + 3],
-            ]) as usize;
+            let surf_off = u32::from_le_bytes([buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3]]) as usize;
             let surf_len = buffer[pos + 4] as usize;
-            let read_off = u32::from_le_bytes([
-                buffer[pos + 5],
-                buffer[pos + 6],
-                buffer[pos + 7],
-                buffer[pos + 8],
-            ]) as usize;
+            let read_off = u32::from_le_bytes([buffer[pos + 5], buffer[pos + 6], buffer[pos + 7], buffer[pos + 8]]) as usize;
             let read_len = buffer[pos + 9] as usize;
-            let pair_id = u16::from_le_bytes([buffer[pos + 10], buffer[pos + 11]]);
-            let cost = i16::from_le_bytes([buffer[pos + 12], buffer[pos + 13]]);
+            let left_id = u16::from_le_bytes([buffer[pos + 10], buffer[pos + 11]]);
+            let right_id = u16::from_le_bytes([buffer[pos + 12], buffer[pos + 13]]);
+            let cost = i16::from_le_bytes([buffer[pos + 14], buffer[pos + 15]]);
 
-            let surface_bytes =
-                &buffer[strings_offset + surf_off..strings_offset + surf_off + surf_len];
-            let reading_bytes =
-                &buffer[strings_offset + read_off..strings_offset + read_off + read_len];
+            let surface_bytes = &buffer[strings_offset + surf_off..strings_offset + surf_off + surf_len];
+            let reading_bytes = &buffer[strings_offset + read_off..strings_offset + read_off + read_len];
 
             entries.push(DictEntry {
                 surface: String::from_utf8_lossy(surface_bytes).to_string(),
-                pair_id,
+                left_id,
+                right_id,
                 word_cost: cost,
                 reading: String::from_utf8_lossy(reading_bytes).to_string(),
             });
@@ -120,16 +111,20 @@ impl Dictionary {
 
         let mut index: HashMap<char, Vec<usize>> = HashMap::new();
         pos = index_offset + 4;
-        for _ in 0..num_index_keys {
+        for i in 0..num_index_keys {
             let ch = char::from_u32(u32::from_le_bytes([
                 buffer[pos],
                 buffer[pos + 1],
                 buffer[pos + 2],
                 buffer[pos + 3],
             ]))
-            .unwrap();
+            .unwrap_or('?');
             let count = u16::from_le_bytes([buffer[pos + 4], buffer[pos + 5]]) as usize;
             pos += 8;
+
+            if i == 0 {
+                eprintln!("Debug: first index entry: char='{}' (U+{:04X}), count={}", ch, ch as u32, count);
+            }
 
             let mut entry_ids = Vec::with_capacity(count);
             for _ in 0..count {
@@ -145,10 +140,27 @@ impl Dictionary {
             index.insert(ch, entry_ids);
         }
 
+        let kita_count = entries.iter().filter(|e| e.surface.starts_with('北')).count();
+        eprintln!("Debug: loaded {} entries, {} start with '北', first 3 surfaces: {:?}",
+                  entries.len(),
+                  kita_count,
+                  entries.iter().take(3).map(|e| &e.surface).collect::<Vec<_>>());
+        eprintln!("Debug: loaded {} index keys, matrix {}x{} = {} entries",
+                  index.len(), max_left, max_right, matrix.len());
+        if let Some(entries_for_kita) = index.get(&'北') {
+            eprintln!("Debug: found {} entries for '北': {:?}",
+                     entries_for_kita.len(),
+                     entries_for_kita.iter().take(3).map(|&i| &entries[i].surface).collect::<Vec<_>>());
+        } else {
+            eprintln!("Debug: no entries found for '北', index keys sample: {:?}",
+                     index.keys().take(5).collect::<Vec<_>>());
+        }
+
         Ok(Dictionary {
             entries,
             index,
             matrix,
+            max_left,
         })
     }
 
@@ -245,13 +257,13 @@ pub fn transliterate(text: &str, dict: &Dictionary) -> String {
             let mut best_prev = None;
 
             for (prev_idx, prev_node) in nodes[start_pos].iter().enumerate() {
-                let prev_pair_id = if start_pos == 0 {
+                let prev_right_id = if start_pos == 0 {
                     0
                 } else {
-                    dict.entries[prev_node.entry_idx].pair_id
+                    dict.entries[prev_node.entry_idx].right_id
                 };
 
-                let conn_cost = dict.get_matrix_cost(prev_pair_id, entry.pair_id) as i32;
+                let conn_cost = dict.get_matrix_cost(prev_right_id, entry.left_id) as i32;
                 let total_cost = prev_node.cost + entry.word_cost as i32 + conn_cost;
 
                 if total_cost < best_cost {
