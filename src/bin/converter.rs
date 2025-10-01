@@ -144,12 +144,6 @@ fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, Vec<Entry>) {
         }
     });
 
-    let kita_count = entries
-        .iter()
-        .filter(|e| e.surface.starts_with('北'))
-        .count();
-    eprintln!("Debug converter: {} entries start with '北'", kita_count);
-
     (pos_id_map, entries)
 }
 
