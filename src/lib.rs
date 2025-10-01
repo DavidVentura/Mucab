@@ -3,6 +3,9 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use zeekstd::Decoder;
 
+const HEADER_SIZE: usize = 16;
+const ENTRY_METADATA_SIZE: usize = 9;
+
 struct OffsetFile<R: Read + Seek> {
     reader: R,
     base_offset: u64,
@@ -105,7 +108,7 @@ impl<'a> Dictionary<'a> {
             let mut surf_bytes = vec![0u8; surf_len];
             self.decoder.read_exact(&mut surf_bytes).unwrap();
 
-            let mut entry_buf = [0u8; 9]; // read_off(4) + read_len(1) + pos_id(2) + cost(2)
+            let mut entry_buf = [0u8; ENTRY_METADATA_SIZE];
             self.decoder.read_exact(&mut entry_buf).unwrap();
 
             let read_off =
@@ -130,8 +133,7 @@ impl<'a> Dictionary<'a> {
         let mut _file = File::open(path)?;
         let mut file = BufReader::new(_file);
 
-        // Read header (16 bytes)
-        let mut header = [0u8; 16];
+        let mut header = [0u8; HEADER_SIZE];
         file.read_exact(&mut header)?;
 
         if &header[0..4] != b"MUCA" {

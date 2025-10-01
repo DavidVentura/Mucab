@@ -7,6 +7,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use zeekstd::{EncodeOptions, Encoder, FrameSizePolicy};
 
+const HEADER_SIZE: u32 = 16;
+const ENTRY_METADATA_SIZE: u32 = 9;
+const INDEX_ENTRY_SIZE: u32 = 10;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
@@ -247,9 +251,7 @@ fn write_binary(
                 current_count += 1;
             }
         }
-        // Calculate byte size of this entry for next iteration
-        // surf_len(1) + surface + read_off(4) + read_len(1) + pos_id(2) + cost(2) = 1 + surf + 9
-        byte_offset += 1 + entry_records[i].0.len() as u32 + 9;
+        byte_offset += 1 + entry_records[i].0.len() as u32 + ENTRY_METADATA_SIZE;
     }
     // Push last group
     if let Some(ch) = current_char {
@@ -258,20 +260,18 @@ fn write_binary(
 
     eprintln!("Index has {} unique characters", index.len());
 
-    let header_size = 16u32;
     let matrix_byte_size = (matrix.len() * 2) as u32;
-    let index_size = 4 + (index.len() as u32 * 10); // num_keys(4) + (char(4) + offset(4) + count(2)) * num_keys
+    let index_size = 4 + (index.len() as u32 * INDEX_ENTRY_SIZE);
 
-    // Calculate variable entry array size: sum of (1 + surf_len + 9) per entry
     let entry_array_size: u32 = entry_records
         .iter()
-        .map(|(surf, _, _, _, _)| 1 + surf.len() as u32 + 9)
+        .map(|(surf, _, _, _, _)| 1 + surf.len() as u32 + ENTRY_METADATA_SIZE)
         .sum();
 
     // strings_offset is now relative to start of decompressed stream (after entries)
     let strings_offset = entry_array_size;
 
-    println!("Header: {} bytes", header_size);
+    println!("Header: {} bytes", HEADER_SIZE);
     writer.write_all(b"MUCA")?;
     writer.write_all(&1u16.to_le_bytes())?;
     writer.write_all(&matrix_size.to_le_bytes())?;
@@ -313,7 +313,6 @@ fn write_binary(
         std::io::Error::new(std::io::ErrorKind::Other, format!("zeekstd error: {:?}", e))
     })?;
 
-    // Write variable-length entries: surf_len(1) + surface + read_off(4) + read_len(1) + pos_id(2) + cost(2)
     for (surf_bytes, read_off, read_len, pos_id, cost) in &entry_records {
         encoder.write_all(&[surf_bytes.len() as u8])?;
         encoder.write_all(surf_bytes)?;
