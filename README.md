@@ -17,4 +17,4 @@ The only focus of this project is to provide compact data format & compact code 
 
 With the cut down data, the uncompressed size changes from 52MB (30MB data + 22MB matrix.def) to 13MB.
 
-Compressed 4.8MB for Mucab and 4.9MB for the original data (Mucab format has indices to make lookup faster)
+Compressed 3.4MB for Mucab and 4.9MB for the original data (Mucab format has indices to make lookup faster)

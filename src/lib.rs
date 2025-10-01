@@ -5,10 +5,10 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 #[derive(Debug, Clone)]
 pub struct DictEntry {
     pub surface: String,
-    pub left_id: u16,
-    pub right_id: u16,
+    pub pos_id: u16,
     pub word_cost: i16,
-    pub reading: String,
+    pub reading_offset: u32,
+    pub reading_len: u8,
 }
 
 pub struct Dictionary {
@@ -16,74 +16,82 @@ pub struct Dictionary {
     entry_offset: u64,
     strings_offset: u64,
     pub num_entries: usize,
-    index: HashMap<char, (usize, usize)>,  // char -> (start_offset, count)
+    index: HashMap<char, (u64, usize)>,  // char -> (byte_offset, count)
+    entry_cache: HashMap<char, Vec<DictEntry>>,  // Cache for bulk-read entries
     matrix: Vec<i16>,
-    max_left: usize,
+    matrix_size: usize,
 }
 
 #[derive(Debug, Clone)]
 struct LatticeNode {
     start_pos: usize,
     end_pos: usize,
-    entry_idx: usize,
+    entry_char: char,
+    entry_local_idx: usize,
     cost: i32,
     prev_node: Option<usize>,
 }
 
 impl Dictionary {
-    fn get_matrix_cost(&self, prev_right_id: u16, curr_left_id: u16) -> i16 {
-        let idx = (prev_right_id as usize) * self.max_left + (curr_left_id as usize);
+    fn get_matrix_cost(&self, prev_id: u16, curr_id: u16) -> i16 {
+        let idx = (prev_id as usize) * self.matrix_size + (curr_id as usize);
         self.matrix.get(idx).copied().unwrap_or(0)
     }
 
-    fn read_entry(&mut self, entry_idx: usize) -> DictEntry {
-        // Read entry record (16 bytes)
-        let pos = self.entry_offset + (entry_idx * 16) as u64;
-        self.file.seek(SeekFrom::Start(pos)).unwrap();
+    fn get_entry(&self, first_char: char, local_idx: usize) -> &DictEntry {
+        &self.entry_cache[&first_char][local_idx]
+    }
 
-        let mut entry_buf = [0u8; 16];
-        self.file.read_exact(&mut entry_buf).unwrap();
+    fn read_reading_at(&mut self, offset: u32, len: u8) -> String {
+        self.file.seek(SeekFrom::Start(self.strings_offset + offset as u64)).unwrap();
+        let mut reading_bytes = vec![0u8; len as usize];
+        self.file.read_exact(&mut reading_bytes).unwrap();
+        String::from_utf8(reading_bytes).unwrap()
+    }
 
-        let surf_off =
-            u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]) as u64;
-        let surf_len = entry_buf[4] as usize;
-        let read_off =
-            u32::from_le_bytes([entry_buf[5], entry_buf[6], entry_buf[7], entry_buf[8]]) as u64;
-        let read_len = entry_buf[9] as usize;
-        let left_id = u16::from_le_bytes([entry_buf[10], entry_buf[11]]);
-        let right_id = u16::from_le_bytes([entry_buf[12], entry_buf[13]]);
-        let cost = i16::from_le_bytes([entry_buf[14], entry_buf[15]]);
+    fn bulk_read_entries(&mut self, first_char: char) -> Vec<DictEntry> {
+        let (byte_offset, count) = *self.index.get(&first_char).unwrap();
+        let mut entries = Vec::with_capacity(count);
 
-        // Read both strings in one operation
-        let min_off = surf_off.min(read_off);
-        let max_end = (surf_off + surf_len as u64).max(read_off + read_len as u64);
-        let total_len = (max_end - min_off) as usize;
+        // Seek directly to the byte offset for this character's entries!
+        self.file.seek(SeekFrom::Start(self.entry_offset + byte_offset)).unwrap();
 
-        self.file.seek(SeekFrom::Start(self.strings_offset + min_off)).unwrap();
-        let mut strings_buf = vec![0u8; total_len];
-        self.file.read_exact(&mut strings_buf).unwrap();
+        // Read 'count' entries
+        for _ in 0..count {
+            // Read variable-length entry
+            let mut surf_len_buf = [0u8; 1];
+            self.file.read_exact(&mut surf_len_buf).unwrap();
+            let surf_len = surf_len_buf[0] as usize;
 
-        let surf_start = (surf_off - min_off) as usize;
-        let read_start = (read_off - min_off) as usize;
+            let mut surf_bytes = vec![0u8; surf_len];
+            self.file.read_exact(&mut surf_bytes).unwrap();
 
-        let surface_bytes = &strings_buf[surf_start..surf_start + surf_len];
-        let reading_bytes = &strings_buf[read_start..read_start + read_len];
+            let mut entry_buf = [0u8; 9];  // read_off(4) + read_len(1) + pos_id(2) + cost(2)
+            self.file.read_exact(&mut entry_buf).unwrap();
 
-        DictEntry {
-            surface: String::from_utf8(surface_bytes.into()).unwrap(),
-            left_id,
-            right_id,
-            word_cost: cost,
-            reading: String::from_utf8(reading_bytes.into()).unwrap(),
+            let read_off = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
+            let read_len = entry_buf[4];
+            let pos_id = u16::from_le_bytes([entry_buf[5], entry_buf[6]]);
+            let cost = i16::from_le_bytes([entry_buf[7], entry_buf[8]]);
+
+            entries.push(DictEntry {
+                surface: String::from_utf8(surf_bytes).unwrap(),
+                pos_id,
+                word_cost: cost,
+                reading_offset: read_off,
+                reading_len: read_len,
+            });
         }
+
+        entries
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
         let mut _file = File::open(path)?;
         let mut file = BufReader::new(_file);
 
-        // Read header (22 bytes)
-        let mut header = [0u8; 22];
+        // Read header (20 bytes)
+        let mut header = [0u8; 20];
         file.read_exact(&mut header)?;
 
         if &header[0..4] != b"MUCA" {
@@ -94,22 +102,21 @@ impl Dictionary {
         }
 
         let _version = u16::from_le_bytes([header[4], header[5]]);
-        let max_left = u16::from_le_bytes([header[6], header[7]]) as usize;
-        let max_right = u16::from_le_bytes([header[8], header[9]]) as usize;
+        let matrix_size = u16::from_le_bytes([header[6], header[7]]) as usize;
         let num_entries =
-            u32::from_le_bytes([header[10], header[11], header[12], header[13]]) as usize;
+            u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
         let index_offset =
-            u32::from_le_bytes([header[14], header[15], header[16], header[17]]) as u64;
+            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as u64;
         let strings_offset =
-            u32::from_le_bytes([header[18], header[19], header[20], header[21]]) as u64;
+            u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as u64;
 
         // Read matrix
-        let matrix_size = max_left * max_right;
-        let mut matrix_bytes = vec![0u8; matrix_size * 2];
+        let matrix_elements = matrix_size * matrix_size;
+        let mut matrix_bytes = vec![0u8; matrix_elements * 2];
         file.read_exact(&mut matrix_bytes)?;
 
-        let mut matrix = vec![0i16; matrix_size];
-        for i in 0..matrix_size {
+        let mut matrix = vec![0i16; matrix_elements];
+        for i in 0..matrix_elements {
             matrix[i] = i16::from_le_bytes([matrix_bytes[i * 2], matrix_bytes[i * 2 + 1]]);
         }
 
@@ -118,32 +125,34 @@ impl Dictionary {
         // Skip to index
         file.seek(SeekFrom::Start(index_offset))?;
 
-        // Read index (now just char + count)
+        // Read index (char + byte_offset + count)
         let mut index_count_buf = [0u8; 4];
         file.read_exact(&mut index_count_buf)?;
         let num_index_keys = u32::from_le_bytes(index_count_buf) as usize;
 
-        let mut index: HashMap<char, (usize, usize)> = HashMap::new();
-        let mut cumulative_offset = 0usize;
+        let mut index: HashMap<char, (u64, usize)> = HashMap::new();
 
         for _ in 0..num_index_keys {
             let mut char_buf = [0u8; 4];
             file.read_exact(&mut char_buf)?;
             let ch = char::from_u32(u32::from_le_bytes(char_buf)).unwrap();
 
+            let mut offset_buf = [0u8; 4];
+            file.read_exact(&mut offset_buf)?;
+            let byte_offset = u32::from_le_bytes(offset_buf) as u64;
+
             let mut count_buf = [0u8; 2];
             file.read_exact(&mut count_buf)?;
             let count = u16::from_le_bytes(count_buf) as usize;
 
-            index.insert(ch, (cumulative_offset, count));
-            cumulative_offset += count;
+            index.insert(ch, (byte_offset, count));
         }
 
         eprintln!(
             "Debug: loaded {} index keys, matrix {}x{} = {} entries",
             index.len(),
-            max_left,
-            max_right,
+            matrix_size,
+            matrix_size,
             matrix.len()
         );
 
@@ -153,12 +162,13 @@ impl Dictionary {
             strings_offset,
             num_entries,
             index,
+            entry_cache: HashMap::new(),
             matrix,
-            max_left,
+            matrix_size,
         })
     }
 
-    fn lookup(&mut self, text: &str, start: usize) -> Vec<usize> {
+    fn lookup(&mut self, text: &str, start: usize) -> Vec<(char, usize)> {
         let chars: Vec<char> = text.chars().collect();
         if start >= chars.len() {
             return Vec::with_capacity(1024);
@@ -167,22 +177,30 @@ impl Dictionary {
         let first_char = chars[start];
         let mut matches = Vec::with_capacity(1024);
 
-        if let Some(&(start_offset, count)) = self.index.get(&first_char) {
-            // Scan entries from start_offset to start_offset + count
-            for i in 0..count {
-                let entry_idx = start_offset + i;
-                let entry = self.read_entry(entry_idx);
-                let entry_chars: Vec<char> = entry.surface.chars().collect();
+        if !self.index.contains_key(&first_char) {
+            return matches;
+        }
 
-                if start + entry_chars.len() <= chars.len() {
-                    let matches_surface = entry_chars
-                        .iter()
-                        .enumerate()
-                        .all(|(i, &c)| chars[start + i] == c);
+        // Check cache, bulk-read if not cached
+        if !self.entry_cache.contains_key(&first_char) {
+            let entries = self.bulk_read_entries(first_char);
+            self.entry_cache.insert(first_char, entries);
+        }
 
-                    if matches_surface {
-                        matches.push(entry_idx);
-                    }
+        // Scan cached entries
+        let cached_entries = &self.entry_cache[&first_char];
+
+        for (i, entry) in cached_entries.iter().enumerate() {
+            let entry_chars: Vec<char> = entry.surface.chars().collect();
+
+            if start + entry_chars.len() <= chars.len() {
+                let matches_surface = entry_chars
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &c)| chars[start + j] == c);
+
+                if matches_surface {
+                    matches.push((first_char, i));
                 }
             }
         }
@@ -191,17 +209,17 @@ impl Dictionary {
     }
 }
 
-fn build_lattice(text: &str, dict: &mut Dictionary) -> (Vec<Vec<(usize, usize)>>, Vec<char>) {
+fn build_lattice(text: &str, dict: &mut Dictionary) -> (Vec<Vec<((char, usize), usize)>>, Vec<char>) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut lattice = vec![Vec::with_capacity(1024); len + 1];
 
     for start in 0..len {
         let matches = dict.lookup(text, start);
-        for entry_idx in matches {
-            let entry = dict.read_entry(entry_idx);
+        for (entry_char, entry_local_idx) in matches {
+            let entry = dict.get_entry(entry_char, entry_local_idx);
             let end = start + entry.surface.chars().count();
-            lattice[end].push((entry_idx, start));
+            lattice[end].push(((entry_char, entry_local_idx), start));
         }
     }
 
@@ -220,7 +238,8 @@ pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
     let bos_node = LatticeNode {
         start_pos: 0,
         end_pos: 0,
-        entry_idx: 0,
+        entry_char: '\0',
+        entry_local_idx: 0,
         cost: 0,
         prev_node: None,
     };
@@ -234,7 +253,8 @@ pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
                     nodes[pos].push(LatticeNode {
                         start_pos: pos - 1,
                         end_pos: pos,
-                        entry_idx: 0,
+                        entry_char: '\0',
+                        entry_local_idx: 0,
                         cost: prev_node.cost + 10000,
                         prev_node: Some(prev_idx),
                     });
@@ -243,23 +263,23 @@ pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
             continue;
         }
 
-        for &(entry_idx, start_pos) in &lattice[pos] {
+        for &((entry_char, entry_local_idx), start_pos) in &lattice[pos] {
             if nodes[start_pos].is_empty() {
                 continue;
             }
 
-            let entry = dict.read_entry(entry_idx);
+            let entry = dict.get_entry(entry_char, entry_local_idx);
             let mut best_cost = i32::MAX;
             let mut best_prev = None;
 
             for (prev_idx, prev_node) in nodes[start_pos].iter().enumerate() {
-                let prev_right_id = if start_pos == 0 {
+                let prev_pos_id = if start_pos == 0 || prev_node.entry_char == '\0' {
                     0
                 } else {
-                    dict.read_entry(prev_node.entry_idx).right_id
+                    dict.get_entry(prev_node.entry_char, prev_node.entry_local_idx).pos_id
                 };
 
-                let conn_cost = dict.get_matrix_cost(prev_right_id, entry.left_id) as i32;
+                let conn_cost = dict.get_matrix_cost(prev_pos_id, entry.pos_id) as i32;
                 let total_cost = prev_node.cost + entry.word_cost as i32 + conn_cost;
 
                 if total_cost < best_cost {
@@ -272,7 +292,8 @@ pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
                 nodes[pos].push(LatticeNode {
                     start_pos,
                     end_pos: pos,
-                    entry_idx,
+                    entry_char,
+                    entry_local_idx,
                     cost: best_cost,
                     prev_node: best_prev,
                 });
@@ -298,11 +319,14 @@ pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
                 break;
             }
 
-            if node.entry_idx == 0 && node.cost >= 10000 {
+            if node.entry_char == '\0' && node.cost >= 10000 {
                 result.push(chars[node.start_pos].to_string());
             } else {
-                let entry = dict.read_entry(node.entry_idx);
-                result.push(entry.reading.clone());
+                let entry = dict.get_entry(node.entry_char, node.entry_local_idx);
+                let read_off = entry.reading_offset;
+                let read_len = entry.reading_len;
+                let reading = dict.read_reading_at(read_off, read_len);
+                result.push(reading);
             }
 
             if let Some(prev_idx) = node.prev_node {
