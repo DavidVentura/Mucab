@@ -1,6 +1,40 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
+use zeekstd::Decoder;
+
+struct OffsetFile<R: Read + Seek> {
+    reader: R,
+    base_offset: u64,
+}
+
+impl<R: Read + Seek> OffsetFile<R> {
+    fn new(mut r: R, base_offset: u64) -> std::io::Result<Self> {
+        r.seek(SeekFrom::Start(base_offset))?;
+        Ok(Self {
+            reader: r,
+            base_offset,
+        })
+    }
+}
+
+impl<R: Read + Seek> Read for OffsetFile<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl<R: Read + Seek> Seek for OffsetFile<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let adjusted_pos = match pos {
+            SeekFrom::Start(offset) => SeekFrom::Start(self.base_offset + offset),
+            SeekFrom::Current(offset) => SeekFrom::Current(offset),
+            SeekFrom::End(offset) => SeekFrom::End(offset),
+        };
+        let result = self.reader.seek(adjusted_pos)?;
+        Ok(result - self.base_offset)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DictEntry {
@@ -11,13 +45,13 @@ pub struct DictEntry {
     pub reading_len: u8,
 }
 
-pub struct Dictionary {
-    file: BufReader<File>,
+pub struct Dictionary<'a> {
+    decoder: Decoder<'a, OffsetFile<BufReader<File>>>,
     entry_offset: u64,
     strings_offset: u64,
     pub num_entries: usize,
-    index: HashMap<char, (u64, usize)>,  // char -> (byte_offset, count)
-    entry_cache: HashMap<char, Vec<DictEntry>>,  // Cache for bulk-read entries
+    index: HashMap<char, (u64, usize)>, // char -> (byte_offset, count)
+    entry_cache: HashMap<char, Vec<DictEntry>>, // Cache for bulk-read entries
     matrix: Vec<i16>,
     matrix_size: usize,
 }
@@ -32,7 +66,7 @@ struct LatticeNode {
     prev_node: Option<usize>,
 }
 
-impl Dictionary {
+impl<'a> Dictionary<'a> {
     fn get_matrix_cost(&self, prev_id: u16, curr_id: u16) -> i16 {
         let idx = (prev_id as usize) * self.matrix_size + (curr_id as usize);
         self.matrix.get(idx).copied().unwrap_or(0)
@@ -43,9 +77,12 @@ impl Dictionary {
     }
 
     fn read_reading_at(&mut self, offset: u32, len: u8) -> String {
-        self.file.seek(SeekFrom::Start(self.strings_offset + offset as u64)).unwrap();
+        let start = self.strings_offset + offset as u64;
+        let end = start + len as u64;
+        self.decoder.set_offset(start).unwrap();
+        self.decoder.set_offset_limit(end).unwrap();
         let mut reading_bytes = vec![0u8; len as usize];
-        self.file.read_exact(&mut reading_bytes).unwrap();
+        self.decoder.read_exact(&mut reading_bytes).unwrap();
         String::from_utf8(reading_bytes).unwrap()
     }
 
@@ -53,23 +90,26 @@ impl Dictionary {
         let (byte_offset, count) = *self.index.get(&first_char).unwrap();
         let mut entries = Vec::with_capacity(count);
 
-        // Seek directly to the byte offset for this character's entries!
-        self.file.seek(SeekFrom::Start(self.entry_offset + byte_offset)).unwrap();
+        // Seek directly to the byte offset for this character's entries in decompressed stream
+        self.decoder
+            .set_offset(self.entry_offset + byte_offset)
+            .unwrap();
 
         // Read 'count' entries
         for _ in 0..count {
             // Read variable-length entry
             let mut surf_len_buf = [0u8; 1];
-            self.file.read_exact(&mut surf_len_buf).unwrap();
+            self.decoder.read_exact(&mut surf_len_buf).unwrap();
             let surf_len = surf_len_buf[0] as usize;
 
             let mut surf_bytes = vec![0u8; surf_len];
-            self.file.read_exact(&mut surf_bytes).unwrap();
+            self.decoder.read_exact(&mut surf_bytes).unwrap();
 
-            let mut entry_buf = [0u8; 9];  // read_off(4) + read_len(1) + pos_id(2) + cost(2)
-            self.file.read_exact(&mut entry_buf).unwrap();
+            let mut entry_buf = [0u8; 9]; // read_off(4) + read_len(1) + pos_id(2) + cost(2)
+            self.decoder.read_exact(&mut entry_buf).unwrap();
 
-            let read_off = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
+            let read_off =
+                u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
             let read_len = entry_buf[4];
             let pos_id = u16::from_le_bytes([entry_buf[5], entry_buf[6]]);
             let cost = i16::from_le_bytes([entry_buf[7], entry_buf[8]]);
@@ -141,19 +181,20 @@ impl Dictionary {
             index.insert(ch, (byte_offset, count));
         }
 
-        // Entry offset is right after index
-        let entry_offset = file.stream_position()?;
-
-        eprintln!(
-            "Debug: loaded {} index keys, matrix {}x{} = {} entries",
-            index.len(),
-            matrix_size,
-            matrix_size,
-            matrix.len()
-        );
+        // Create zeekstd decoder for the compressed block (entries + strings)
+        // Everything after the index is compressed
+        let compressed_start = file.stream_position()?;
+        let offset_file = OffsetFile::new(file, compressed_start)?;
+        let decoder = Decoder::new(offset_file).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("zeekstd error: {:?}", e),
+            )
+        })?;
+        let entry_offset = 0; // Entries start at offset 0 in decompressed stream
 
         Ok(Dictionary {
-            file,
+            decoder,
             entry_offset,
             strings_offset,
             num_entries,
@@ -205,7 +246,10 @@ impl Dictionary {
     }
 }
 
-fn build_lattice(text: &str, dict: &mut Dictionary) -> (Vec<Vec<((char, usize), usize)>>, Vec<char>) {
+fn build_lattice<'a>(
+    text: &str,
+    dict: &mut Dictionary<'a>,
+) -> (Vec<Vec<((char, usize), usize)>>, Vec<char>) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut lattice = vec![Vec::with_capacity(1024); len + 1];
@@ -222,7 +266,7 @@ fn build_lattice(text: &str, dict: &mut Dictionary) -> (Vec<Vec<((char, usize), 
     (lattice, chars)
 }
 
-pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
+pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
     if text.is_empty() {
         return String::new();
     }
@@ -272,7 +316,8 @@ pub fn transliterate(text: &str, dict: &mut Dictionary) -> String {
                 let prev_pos_id = if start_pos == 0 || prev_node.entry_char == '\0' {
                     0
                 } else {
-                    dict.get_entry(prev_node.entry_char, prev_node.entry_local_idx).pos_id
+                    dict.get_entry(prev_node.entry_char, prev_node.entry_local_idx)
+                        .pos_id
                 };
 
                 let conn_cost = dict.get_matrix_cost(prev_pos_id, entry.pos_id) as i32;

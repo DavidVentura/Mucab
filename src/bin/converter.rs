@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use zeekstd::{EncodeOptions, Encoder, FrameSizePolicy};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -36,13 +37,8 @@ fn main() {
     );
 
     let output_path = format!("{}/mucab.bin", output_dir);
-    write_binary(
-        &output_path,
-        &entries,
-        &matrix_data,
-        matrix_size as u16,
-    )
-    .expect("Failed to write binary");
+    write_binary(&output_path, &entries, &matrix_data, matrix_size as u16)
+        .expect("Failed to write binary");
     println!("Wrote {}", output_path);
 
     println!("Conversion complete!");
@@ -98,7 +94,11 @@ fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, Vec<Entry>) {
 
                     let left_id_str = parts[1].to_string();
                     let right_id_str = parts[2].to_string();
-                    assert_eq!(left_id_str, right_id_str, "left_id and right_id differ for surface: {}", surface);
+                    assert_eq!(
+                        left_id_str, right_id_str,
+                        "left_id and right_id differ for surface: {}",
+                        surface
+                    );
 
                     let cost: i32 = parts[3].parse().unwrap_or(0);
                     if cost < i16::MIN as i32 || cost > i16::MAX as i32 {
@@ -175,10 +175,9 @@ fn load_matrix(
             let curr_id_str = parts[1].to_string();
             let cost: i16 = parts[2].parse().unwrap_or(0);
 
-            if let (Some(&prev_id), Some(&curr_id)) = (
-                pos_id_map.get(&prev_id_str),
-                pos_id_map.get(&curr_id_str),
-            ) {
+            if let (Some(&prev_id), Some(&curr_id)) =
+                (pos_id_map.get(&prev_id_str), pos_id_map.get(&curr_id_str))
+            {
                 // matrix[prev_id][curr_id] = cost
                 // Flatten: matrix[prev_id * matrix_size + curr_id] = cost
                 let idx = (prev_id as usize) * matrix_size + (curr_id as usize);
@@ -200,7 +199,7 @@ fn write_binary(
     let mut writer = BufWriter::new(file);
 
     // First, build entry_records with compressed strings
-    let mut strings_data = Vec::new();  // Compressed supersequence
+    let mut strings_data = Vec::new(); // Compressed supersequence
     let mut entry_records = Vec::new();
 
     for entry in entries.iter() {
@@ -226,7 +225,7 @@ fn write_binary(
         let reading_len = entry.reading.len() as u8;
 
         entry_records.push((
-            entry.surface.as_bytes().to_vec(),  // Store surface bytes directly
+            entry.surface.as_bytes().to_vec(), // Store surface bytes directly
             reading_offset,
             reading_len,
             entry.pos_id,
@@ -270,11 +269,13 @@ fn write_binary(
     let index_size = 4 + (index.len() as u32 * 10); // num_keys(4) + (char(4) + offset(4) + count(2)) * num_keys
 
     // Calculate variable entry array size: sum of (1 + surf_len + 9) per entry
-    let entry_array_size: u32 = entry_records.iter()
+    let entry_array_size: u32 = entry_records
+        .iter()
         .map(|(surf, _, _, _, _)| 1 + surf.len() as u32 + 9)
         .sum();
 
-    let strings_offset = header_size + matrix_byte_size + index_size + entry_array_size;
+    // strings_offset is now relative to start of decompressed stream (after entries)
+    let strings_offset = entry_array_size;
 
     println!("Header: {} bytes", header_size);
     writer.write_all(b"MUCA")?;
@@ -302,24 +303,44 @@ fn write_binary(
         writer.write_all(&count.to_le_bytes())?;
     }
 
+    // Create zeekstd encoder for compressed block (entries + strings)
     println!(
-        "Entries: {} bytes ({} entries)",
+        "Compressing entries ({} bytes) + strings ({} bytes)...",
         entry_array_size,
-        entry_records.len()
+        strings_data.len()
     );
+
+    let opts = EncodeOptions::new()
+        .checksum_flag(false)
+        .compression_level(9)
+        .frame_size_policy(FrameSizePolicy::Uncompressed(1024 * 128));
+
+    let mut encoder = Encoder::with_opts(writer, opts).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("zeekstd error: {:?}", e))
+    })?;
 
     // Write variable-length entries: surf_len(1) + surface + read_off(4) + read_len(1) + pos_id(2) + cost(2)
     for (surf_bytes, read_off, read_len, pos_id, cost) in &entry_records {
-        writer.write_all(&[surf_bytes.len() as u8])?;
-        writer.write_all(surf_bytes)?;
-        writer.write_all(&read_off.to_le_bytes())?;
-        writer.write_all(&[*read_len])?;
-        writer.write_all(&pos_id.to_le_bytes())?;
-        writer.write_all(&cost.to_le_bytes())?;
+        encoder.write_all(&[surf_bytes.len() as u8])?;
+        encoder.write_all(surf_bytes)?;
+        encoder.write_all(&read_off.to_le_bytes())?;
+        encoder.write_all(&[*read_len])?;
+        encoder.write_all(&pos_id.to_le_bytes())?;
+        encoder.write_all(&cost.to_le_bytes())?;
     }
 
-    println!("Strings: {} bytes (compressed)", strings_data.len());
-    writer.write_all(&strings_data)?;
+    // Write strings immediately after entries in same compressed block
+    encoder.write_all(&strings_data)?;
+
+    let compressed_size = encoder.finish().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("zeekstd error: {:?}", e))
+    })?;
+    println!(
+        "Compressed block: {} bytes (from {} bytes uncompressed, {:.1}% of original)",
+        compressed_size,
+        entry_array_size + strings_data.len() as u32,
+        100.0 * compressed_size as f64 / (entry_array_size + strings_data.len() as u32) as f64
+    );
 
     Ok(())
 }
