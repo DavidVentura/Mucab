@@ -11,11 +11,11 @@ fn main() {
     let dict_path = &args[1];
     let input_text = &args[2];
 
-    let dict = Dictionary::load(dict_path).expect("Failed to load dictionary");
-    println!("Loaded {} dictionary entries", dict.entries.len());
+    let mut dict = Dictionary::load(dict_path).expect("Failed to load dictionary");
+    println!("Loaded dictionary with {} entries", dict.num_entries);
 
     println!("Input: {}", input_text);
 
-    let result = transliterate(input_text, &dict);
+    let result = transliterate(input_text, &mut dict);
     println!("Output: {}", result);
 }

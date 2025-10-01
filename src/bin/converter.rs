@@ -20,21 +20,41 @@ fn main() {
 
     println!("Processing CSV files from {}...", input_dir);
     let (left_id_map, right_id_map, entries) = process_csv_files(input_dir);
-    println!("Found {} unique left_ids, {} unique right_ids", left_id_map.len(), right_id_map.len());
+    println!(
+        "Found {} unique left_ids, {} unique right_ids",
+        left_id_map.len(),
+        right_id_map.len()
+    );
     println!("Processed {} entries", entries.len());
 
     let matrix_path = format!("{}/matrix.def", input_dir);
-    let (matrix_data, max_left, max_right) = load_matrix(&matrix_path, &left_id_map, &right_id_map).expect("Failed to load matrix");
+    let (matrix_data, max_left, max_right) =
+        load_matrix(&matrix_path, &left_id_map, &right_id_map).expect("Failed to load matrix");
 
-    println!("Matrix before compaction: would be {}x{} = {} entries ({} bytes)",
-             left_id_map.len(), right_id_map.len(),
-             left_id_map.len() * right_id_map.len(),
-             left_id_map.len() * right_id_map.len() * 2);
-    println!("Matrix after compaction: {}x{} = {} entries ({} bytes)",
-             max_left, max_right, matrix_data.len(), matrix_data.len() * 2);
+    println!(
+        "Matrix before compaction: would be {}x{} = {} entries ({} bytes)",
+        left_id_map.len(),
+        right_id_map.len(),
+        left_id_map.len() * right_id_map.len(),
+        left_id_map.len() * right_id_map.len() * 2
+    );
+    println!(
+        "Matrix after compaction: {}x{} = {} entries ({} bytes)",
+        max_left,
+        max_right,
+        matrix_data.len(),
+        matrix_data.len() * 2
+    );
 
     let output_path = format!("{}/mucab.bin", output_dir);
-    write_binary(&output_path, &entries, &matrix_data, max_left as u16, max_right as u16).expect("Failed to write binary");
+    write_binary(
+        &output_path,
+        &entries,
+        &matrix_data,
+        max_left as u16,
+        max_right as u16,
+    )
+    .expect("Failed to write binary");
     println!("Wrote {}", output_path);
 
     println!("Conversion complete!");
@@ -137,7 +157,17 @@ fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, HashMap<String, 
         }
     }
 
-    entries.sort_by(|a, b| a.surface.cmp(&b.surface));
+    // Sort by first character, then by surface
+    entries.sort_by(|a, b| {
+        let a_first = a.surface.chars().next();
+        let b_first = b.surface.chars().next();
+        match (a_first, b_first) {
+            (Some(ac), Some(bc)) => {
+                ac.cmp(&bc).then_with(|| a.surface.cmp(&b.surface))
+            }
+            _ => a.surface.cmp(&b.surface),
+        }
+    });
 
     let kita_count = entries
         .iter()
@@ -172,7 +202,10 @@ fn load_matrix(
             let right_id_str = parts[1].to_string();
             let cost: i16 = parts[2].parse().unwrap_or(0);
 
-            if let (Some(&left_id), Some(&right_id)) = (left_id_map.get(&left_id_str), right_id_map.get(&right_id_str)) {
+            if let (Some(&left_id), Some(&right_id)) = (
+                left_id_map.get(&left_id_str),
+                right_id_map.get(&right_id_str),
+            ) {
                 // matrix[prev.right_id][curr.left_id] = cost
                 // Flatten: matrix[right_id * max_left + left_id] = cost
                 let idx = (right_id as usize) * max_left + (left_id as usize);
@@ -184,16 +217,40 @@ fn load_matrix(
     Ok((matrix, max_left, max_right))
 }
 
-fn write_binary(path: &str, entries: &[Entry], matrix: &[i16], max_left: u16, max_right: u16) -> std::io::Result<()> {
+fn write_binary(
+    path: &str,
+    entries: &[Entry],
+    matrix: &[i16],
+    max_left: u16,
+    max_right: u16,
+) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
-    let mut index: HashMap<char, Vec<u32>> = HashMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
+    // Build index as (char, count) since entries are sorted by first char
+    let mut index: Vec<(char, u16)> = Vec::new();
+    let mut current_char: Option<char> = None;
+    let mut current_count = 0u16;
+
+    for entry in entries.iter() {
         if let Some(first_char) = entry.surface.chars().next() {
-            index.entry(first_char).or_default().push(idx as u32);
+            if Some(first_char) != current_char {
+                if let Some(ch) = current_char {
+                    index.push((ch, current_count));
+                }
+                current_char = Some(first_char);
+                current_count = 1;
+            } else {
+                current_count += 1;
+            }
         }
     }
+    // Push last group
+    if let Some(ch) = current_char {
+        index.push((ch, current_count));
+    }
+
+    eprintln!("Index has {} unique characters", index.len());
 
     let mut strings_data = Vec::new();
     let mut entry_records = Vec::new();
@@ -223,10 +280,8 @@ fn write_binary(path: &str, entries: &[Entry], matrix: &[i16], max_left: u16, ma
     let entry_array_size = (entry_records.len() * 16) as u32;
 
     let index_offset = header_size + matrix_size + entry_array_size;
-    let strings_offset = index_offset
-        + 4
-        + (index.len() as u32 * 8)
-        + index.values().map(|v| v.len() as u32 * 4).sum::<u32>();
+    let index_size = 4 + (index.len() as u32 * 6);  // num_keys(4) + (char(4) + count(2)) * num_keys
+    let strings_offset = index_offset + index_size;
 
     println!("Header: {} bytes", header_size);
     writer.write_all(b"MUCA")?;
@@ -237,7 +292,13 @@ fn write_binary(path: &str, entries: &[Entry], matrix: &[i16], max_left: u16, ma
     writer.write_all(&index_offset.to_le_bytes())?;
     writer.write_all(&strings_offset.to_le_bytes())?;
 
-    println!("Matrix: {} bytes ({} entries, {}x{})", matrix_size, matrix.len(), max_left, max_right);
+    println!(
+        "Matrix: {} bytes ({} entries, {}x{})",
+        matrix_size,
+        matrix.len(),
+        max_left,
+        max_right
+    );
     for &cost in matrix {
         writer.write_all(&cost.to_le_bytes())?;
     }
@@ -247,6 +308,9 @@ fn write_binary(path: &str, entries: &[Entry], matrix: &[i16], max_left: u16, ma
         entry_array_size,
         entry_records.len()
     );
+
+    let file2 = File::create("strings")?;
+    let mut w2 = BufWriter::new(file2);
     for (surf_off, surf_len, read_off, read_len, left_id, right_id, cost) in &entry_records {
         writer.write_all(&surf_off.to_le_bytes())?;
         writer.write_all(&[*surf_len])?;
@@ -257,20 +321,16 @@ fn write_binary(path: &str, entries: &[Entry], matrix: &[i16], max_left: u16, ma
         writer.write_all(&cost.to_le_bytes())?;
     }
 
-    let index_size = 4 + index.iter().map(|(_, v)| 8 + v.len() * 4).sum::<usize>();
     println!("Index: {} bytes ({} keys)", index_size, index.len());
     writer.write_all(&(index.len() as u32).to_le_bytes())?;
-    for (ch, entry_ids) in &index {
+    for (ch, count) in &index {
         writer.write_all(&(*ch as u32).to_le_bytes())?;
-        writer.write_all(&(entry_ids.len() as u16).to_le_bytes())?;
-        writer.write_all(&[0u8; 2])?; // padding
-        for &entry_id in entry_ids {
-            writer.write_all(&entry_id.to_le_bytes())?;
-        }
+        writer.write_all(&count.to_le_bytes())?;
     }
 
     println!("Strings: {} bytes", strings_data.len());
     writer.write_all(&strings_data)?;
+    w2.write_all(&strings_data)?;
 
     Ok(())
 }
