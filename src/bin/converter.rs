@@ -4,7 +4,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use zeekstd::{EncodeOptions, Encoder, FrameSizePolicy};
 
 const HEADER_SIZE: u32 = 16;
@@ -212,7 +212,7 @@ fn write_binary(
             if suffix_len > reading_bytes.len() {
                 continue;
             }
-            if &strings_data[start..] == &reading_bytes[..suffix_len] {
+            if strings_data[start..] == reading_bytes[..suffix_len] {
                 best_overlap = suffix_len;
                 break;
             }
@@ -308,7 +308,7 @@ fn write_binary(
         .frame_size_policy(FrameSizePolicy::Uncompressed(1024 * 128));
 
     let mut encoder = Encoder::with_opts(writer, opts).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("zeekstd error: {:?}", e))
+        std::io::Error::other(format!("zeekstd error: {:?}", e))
     })?;
 
     for (surf_bytes, read_off, read_len, pos_id, cost) in &entry_records {
@@ -324,7 +324,7 @@ fn write_binary(
     encoder.write_all(&strings_data)?;
 
     let compressed_size = encoder.finish().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("zeekstd error: {:?}", e))
+        std::io::Error::other(format!("zeekstd error: {:?}", e))
     })?;
     println!(
         "Compressed block: {} bytes (from {} bytes uncompressed, {:.1}% of original)",

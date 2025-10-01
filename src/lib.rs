@@ -7,6 +7,8 @@ const HEADER_SIZE: usize = 16;
 const ENTRY_METADATA_SIZE: usize = 9;
 const DEFAULT_CAPACITY: usize = 1024;
 
+type Lattice = Vec<Vec<((char, usize), usize)>>;
+
 struct OffsetFile<R: Read + Seek> {
     reader: R,
     base_offset: u64,
@@ -238,7 +240,7 @@ impl<'a> Dictionary<'a> {
 fn build_lattice<'a>(
     text: &str,
     dict: &mut Dictionary<'a>,
-) -> (Vec<Vec<((char, usize), usize)>>, Vec<char>) {
+) -> (Lattice, Vec<char>) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut lattice = vec![Vec::with_capacity(DEFAULT_CAPACITY); len + 1];
