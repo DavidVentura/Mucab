@@ -55,11 +55,11 @@ struct Entry {
     reading: String,
 }
 
-fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, Vec<Entry>) {
+fn process_csv_files(input_dir: &str) -> (HashMap<i16, u16>, Vec<Entry>) {
     let pattern = format!("{}/*.csv", input_dir);
     let han_regex = Regex::new(r"^\p{Han}+").unwrap();
 
-    let mut pos_id_map: HashMap<String, u16> = HashMap::new();
+    let mut pos_id_map: HashMap<i16, u16> = HashMap::new();
     let mut entries = Vec::new();
 
     for entry in glob(&pattern).expect("Failed to read glob pattern") {
@@ -96,8 +96,8 @@ fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, Vec<Entry>) {
                         continue;
                     }
 
-                    let left_id_str = parts[1].to_string();
-                    let right_id_str = parts[2].to_string();
+                    let left_id_str = parts[1];
+                    let right_id_str = parts[2];
                     assert_eq!(
                         left_id_str, right_id_str,
                         "left_id and right_id differ for surface: {}",
@@ -118,13 +118,15 @@ fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, Vec<Entry>) {
                     }
 
                     let pos_id_len = pos_id_map.len();
-                    let pos_id = *pos_id_map.entry(left_id_str.clone()).or_insert_with(|| {
-                        let id = pos_id_len as u16;
-                        if id == 65535 {
-                            panic!("Too many unique pos_ids! Maximum is 65535.");
-                        }
-                        id
-                    });
+                    let pos_id = *pos_id_map
+                        .entry(left_id_str.parse().unwrap())
+                        .or_insert_with(|| {
+                            let id = pos_id_len as u16;
+                            if id == 65535 {
+                                panic!("Too many unique pos_ids! Maximum is 65535.");
+                            }
+                            id
+                        });
 
                     entries.push(Entry {
                         surface: surface.to_string(),
@@ -153,31 +155,29 @@ fn process_csv_files(input_dir: &str) -> (HashMap<String, u16>, Vec<Entry>) {
 
 fn load_matrix(
     input_path: &str,
-    pos_id_map: &HashMap<String, u16>,
+    pos_id_map: &HashMap<i16, u16>,
 ) -> std::io::Result<(Vec<i16>, usize)> {
-    let file = File::open(input_path)?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut data = String::with_capacity(23 * 1024 * 1024);
+    let mut file = File::open(input_path)?;
+    file.read_to_string(&mut data).unwrap();
+    let mut lines = data.lines();
 
-    lines.next(); // skip header
+    lines.next();
 
     let matrix_size = pos_id_map.len();
     let mut matrix = vec![0i16; matrix_size * matrix_size];
 
     for line in lines {
-        let line = line?;
         let parts: Vec<&str> = line.split_whitespace().collect();
 
         if parts.len() >= 3 {
-            let prev_id_str = parts[0].to_string();
-            let curr_id_str = parts[1].to_string();
-            let cost: i16 = parts[2].parse().unwrap_or(0);
+            let left: i16 = parts[0].parse().unwrap();
+            let right: i16 = parts[1].parse().unwrap();
+            let cost: i16 = parts[2].parse().unwrap();
 
             if let (Some(&prev_id), Some(&curr_id)) =
-                (pos_id_map.get(&prev_id_str), pos_id_map.get(&curr_id_str))
+                (pos_id_map.get(&left), pos_id_map.get(&right))
             {
-                // matrix[prev_id][curr_id] = cost
-                // Flatten: matrix[prev_id * matrix_size + curr_id] = cost
                 let idx = (prev_id as usize) * matrix_size + (curr_id as usize);
                 matrix[idx] = cost;
             }
@@ -223,7 +223,7 @@ fn write_binary(
         let reading_len = entry.reading.len() as u8;
 
         entry_records.push((
-            entry.surface.as_bytes().to_vec(), // Store surface bytes directly
+            entry.surface.as_bytes().to_vec(),
             reading_offset,
             reading_len,
             entry.pos_id,
@@ -253,7 +253,6 @@ fn write_binary(
         }
         byte_offset += 1 + entry_records[i].0.len() as u32 + ENTRY_METADATA_SIZE;
     }
-    // Push last group
     if let Some(ch) = current_char {
         index.push((ch, current_byte_offset, current_count));
     }
@@ -268,7 +267,6 @@ fn write_binary(
         .map(|(surf, _, _, _, _)| 1 + surf.len() as u32 + ENTRY_METADATA_SIZE)
         .sum();
 
-    // strings_offset is now relative to start of decompressed stream (after entries)
     let strings_offset = entry_array_size;
 
     println!("Header: {} bytes", HEADER_SIZE);
