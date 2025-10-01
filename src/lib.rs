@@ -77,8 +77,11 @@ impl<'a> Dictionary<'a> {
         self.matrix.get(idx).copied().unwrap_or(0)
     }
 
-    fn get_entry(&self, first_char: char, local_idx: usize) -> &DictEntry {
-        &self.entry_cache[&first_char][local_idx]
+    fn get_entry(&mut self, first_char: char, local_idx: usize) -> Option<&DictEntry> {
+        if !self.index.contains_key(&first_char) {
+            return None;
+        }
+        self.entry_cache.get(&first_char)?.get(local_idx)
     }
 
     fn read_reading_at(&mut self, offset: u32, len: u8) -> String {
@@ -99,7 +102,9 @@ impl<'a> Dictionary<'a> {
 
         for _ in 0..count {
             let mut surf_len = 0u8;
-            self.decoder.read_exact(std::slice::from_mut(&mut surf_len)).unwrap();
+            self.decoder
+                .read_exact(std::slice::from_mut(&mut surf_len))
+                .unwrap();
             let surf_len = surf_len as usize;
 
             let mut surf_bytes = vec![0u8; surf_len];
@@ -237,10 +242,7 @@ impl<'a> Dictionary<'a> {
     }
 }
 
-fn build_lattice<'a>(
-    text: &str,
-    dict: &mut Dictionary<'a>,
-) -> (Lattice, Vec<char>) {
+fn build_lattice<'a>(text: &str, dict: &mut Dictionary<'a>) -> (Lattice, Vec<char>) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut lattice = vec![Vec::with_capacity(DEFAULT_CAPACITY); len + 1];
@@ -248,9 +250,10 @@ fn build_lattice<'a>(
     for start in 0..len {
         let matches = dict.lookup(text, start);
         for (entry_char, entry_local_idx) in matches {
-            let entry = dict.get_entry(entry_char, entry_local_idx);
-            let end = start + entry.surface.chars().count();
-            lattice[end].push(((entry_char, entry_local_idx), start));
+            if let Some(entry) = dict.get_entry(entry_char, entry_local_idx) {
+                let end = start + entry.surface.chars().count();
+                lattice[end].push(((entry_char, entry_local_idx), start));
+            }
         }
     }
 
@@ -299,7 +302,11 @@ pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
                 continue;
             }
 
-            let entry = dict.get_entry(entry_char, entry_local_idx);
+            let Some(entry) = dict.get_entry(entry_char, entry_local_idx) else {
+                continue;
+            };
+            let entry_pos_id = entry.pos_id;
+            let entry_word_cost = entry.word_cost;
             let mut best_cost = i32::MAX;
             let mut best_prev = None;
 
@@ -308,11 +315,12 @@ pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
                     0
                 } else {
                     dict.get_entry(prev_node.entry_char, prev_node.entry_local_idx)
-                        .pos_id
+                        .map(|e| e.pos_id)
+                        .unwrap_or(0)
                 };
 
-                let conn_cost = dict.get_matrix_cost(prev_pos_id, entry.pos_id) as i32;
-                let total_cost = prev_node.cost + entry.word_cost as i32 + conn_cost;
+                let conn_cost = dict.get_matrix_cost(prev_pos_id, entry_pos_id) as i32;
+                let total_cost = prev_node.cost + entry_word_cost as i32 + conn_cost;
 
                 if total_cost < best_cost {
                     best_cost = total_cost;
@@ -350,8 +358,7 @@ pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
 
             if node.entry_char == '\0' && node.cost >= 10000 {
                 result.push(chars[node.start_pos].to_string());
-            } else {
-                let entry = dict.get_entry(node.entry_char, node.entry_local_idx);
+            } else if let Some(entry) = dict.get_entry(node.entry_char, node.entry_local_idx) {
                 let read_off = entry.reading_offset;
                 let read_len = entry.reading_len;
                 let reading = dict.read_reading_at(read_off, read_len);
