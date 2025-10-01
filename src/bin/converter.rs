@@ -199,13 +199,30 @@ fn write_binary(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
-    // First, build entry_records
-    let mut strings_data = Vec::new();  // Only readings now
+    // First, build entry_records with compressed strings
+    let mut strings_data = Vec::new();  // Compressed supersequence
     let mut entry_records = Vec::new();
 
     for entry in entries.iter() {
-        let reading_offset = strings_data.len() as u32;
-        strings_data.extend_from_slice(entry.reading.as_bytes());
+        let reading_bytes = entry.reading.as_bytes();
+
+        // Find longest suffix of strings_data that matches a prefix of reading
+        let mut best_overlap = 0;
+        let search_start = strings_data.len().saturating_sub(reading_bytes.len());
+
+        for start in search_start..strings_data.len() {
+            let suffix_len = strings_data.len() - start;
+            if suffix_len > reading_bytes.len() {
+                continue;
+            }
+            if &strings_data[start..] == &reading_bytes[..suffix_len] {
+                best_overlap = suffix_len;
+                break;
+            }
+        }
+
+        let reading_offset = (strings_data.len() - best_overlap) as u32;
+        strings_data.extend_from_slice(&reading_bytes[best_overlap..]);
         let reading_len = entry.reading.len() as u8;
 
         entry_records.push((
