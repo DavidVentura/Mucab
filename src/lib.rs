@@ -90,8 +90,8 @@ impl Dictionary {
         let mut _file = File::open(path)?;
         let mut file = BufReader::new(_file);
 
-        // Read header (20 bytes)
-        let mut header = [0u8; 20];
+        // Read header (16 bytes)
+        let mut header = [0u8; 16];
         file.read_exact(&mut header)?;
 
         if &header[0..4] != b"MUCA" {
@@ -105,10 +105,8 @@ impl Dictionary {
         let matrix_size = u16::from_le_bytes([header[6], header[7]]) as usize;
         let num_entries =
             u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-        let index_offset =
-            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as u64;
         let strings_offset =
-            u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as u64;
+            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as u64;
 
         // Read matrix
         let matrix_elements = matrix_size * matrix_size;
@@ -120,12 +118,7 @@ impl Dictionary {
             matrix[i] = i16::from_le_bytes([matrix_bytes[i * 2], matrix_bytes[i * 2 + 1]]);
         }
 
-        let entry_offset = file.stream_position()?;
-
-        // Skip to index
-        file.seek(SeekFrom::Start(index_offset))?;
-
-        // Read index (char + byte_offset + count)
+        // Read index immediately after matrix (no seek needed)
         let mut index_count_buf = [0u8; 4];
         file.read_exact(&mut index_count_buf)?;
         let num_index_keys = u32::from_le_bytes(index_count_buf) as usize;
@@ -147,6 +140,9 @@ impl Dictionary {
 
             index.insert(ch, (byte_offset, count));
         }
+
+        // Entry offset is right after index
+        let entry_offset = file.stream_position()?;
 
         eprintln!(
             "Debug: loaded {} index keys, matrix {}x{} = {} entries",

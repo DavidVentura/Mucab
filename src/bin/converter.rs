@@ -265,24 +265,22 @@ fn write_binary(
 
     eprintln!("Index has {} unique characters", index.len());
 
-    let header_size = 20u32;
+    let header_size = 16u32;
     let matrix_byte_size = (matrix.len() * 2) as u32;
+    let index_size = 4 + (index.len() as u32 * 10); // num_keys(4) + (char(4) + offset(4) + count(2)) * num_keys
 
     // Calculate variable entry array size: sum of (1 + surf_len + 9) per entry
     let entry_array_size: u32 = entry_records.iter()
         .map(|(surf, _, _, _, _)| 1 + surf.len() as u32 + 9)
         .sum();
 
-    let index_offset = header_size + matrix_byte_size + entry_array_size;
-    let index_size = 4 + (index.len() as u32 * 10); // num_keys(4) + (char(4) + offset(4) + count(2)) * num_keys
-    let strings_offset = index_offset + index_size;
+    let strings_offset = header_size + matrix_byte_size + index_size + entry_array_size;
 
     println!("Header: {} bytes", header_size);
     writer.write_all(b"MUCA")?;
     writer.write_all(&1u16.to_le_bytes())?;
     writer.write_all(&matrix_size.to_le_bytes())?;
     writer.write_all(&(entries.len() as u32).to_le_bytes())?;
-    writer.write_all(&index_offset.to_le_bytes())?;
     writer.write_all(&strings_offset.to_le_bytes())?;
 
     println!(
@@ -294,6 +292,14 @@ fn write_binary(
     );
     for &cost in matrix {
         writer.write_all(&cost.to_le_bytes())?;
+    }
+
+    println!("Index: {} bytes ({} keys)", index_size, index.len());
+    writer.write_all(&(index.len() as u32).to_le_bytes())?;
+    for (ch, byte_offset, count) in &index {
+        writer.write_all(&(*ch as u32).to_le_bytes())?;
+        writer.write_all(&byte_offset.to_le_bytes())?;
+        writer.write_all(&count.to_le_bytes())?;
     }
 
     println!(
@@ -312,15 +318,7 @@ fn write_binary(
         writer.write_all(&cost.to_le_bytes())?;
     }
 
-    println!("Index: {} bytes ({} keys)", index_size, index.len());
-    writer.write_all(&(index.len() as u32).to_le_bytes())?;
-    for (ch, byte_offset, count) in &index {
-        writer.write_all(&(*ch as u32).to_le_bytes())?;
-        writer.write_all(&byte_offset.to_le_bytes())?;
-        writer.write_all(&count.to_le_bytes())?;
-    }
-
-    println!("Strings: {} bytes (readings only)", strings_data.len());
+    println!("Strings: {} bytes (compressed)", strings_data.len());
     writer.write_all(&strings_data)?;
 
     Ok(())
