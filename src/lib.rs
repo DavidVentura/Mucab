@@ -377,3 +377,29 @@ pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
     result.reverse();
     result.join("")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nihon() {
+        let mut dict = Dictionary::load("out/mucab.bin").expect("Failed to load dictionary");
+        let result = transliterate("日本", &mut dict);
+        assert_eq!(result, "ニッポン");
+    }
+
+    #[test]
+    fn test_nihongo() {
+        let mut dict = Dictionary::load("out/mucab.bin").expect("Failed to load dictionary");
+        let result = transliterate("日本語", &mut dict);
+        assert_eq!(result, "ニホンゴ");
+    }
+
+    #[test]
+    fn test_tokyo() {
+        let mut dict = Dictionary::load("out/mucab.bin").expect("Failed to load dictionary");
+        let result = transliterate("東京", &mut dict);
+        assert_eq!(result, "トーキョー");
+    }
+}
