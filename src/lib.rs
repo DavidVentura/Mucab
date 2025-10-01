@@ -5,6 +5,7 @@ use zeekstd::Decoder;
 
 const HEADER_SIZE: usize = 16;
 const ENTRY_METADATA_SIZE: usize = 9;
+const DEFAULT_CAPACITY: usize = 1024;
 
 struct OffsetFile<R: Read + Seek> {
     reader: R,
@@ -50,11 +51,10 @@ pub struct DictEntry {
 
 pub struct Dictionary<'a> {
     decoder: Decoder<'a, OffsetFile<BufReader<File>>>,
-    entry_offset: u64,
     strings_offset: u64,
     pub num_entries: usize,
-    index: HashMap<char, (u64, usize)>, // char -> (byte_offset, count)
-    entry_cache: HashMap<char, Vec<DictEntry>>, // Cache for bulk-read entries
+    index: HashMap<char, (u64, usize)>,
+    entry_cache: HashMap<char, Vec<DictEntry>>,
     matrix: Vec<i16>,
     matrix_size: usize,
 }
@@ -93,17 +93,12 @@ impl<'a> Dictionary<'a> {
         let (byte_offset, count) = *self.index.get(&first_char).unwrap();
         let mut entries = Vec::with_capacity(count);
 
-        // Seek directly to the byte offset for this character's entries in decompressed stream
-        self.decoder
-            .set_offset(self.entry_offset + byte_offset)
-            .unwrap();
+        self.decoder.set_offset(byte_offset).unwrap();
 
-        // Read 'count' entries
         for _ in 0..count {
-            // Read variable-length entry
-            let mut surf_len_buf = [0u8; 1];
-            self.decoder.read_exact(&mut surf_len_buf).unwrap();
-            let surf_len = surf_len_buf[0] as usize;
+            let mut surf_len = 0u8;
+            self.decoder.read_exact(std::slice::from_mut(&mut surf_len)).unwrap();
+            let surf_len = surf_len as usize;
 
             let mut surf_bytes = vec![0u8; surf_len];
             self.decoder.read_exact(&mut surf_bytes).unwrap();
@@ -130,8 +125,7 @@ impl<'a> Dictionary<'a> {
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
-        let mut _file = File::open(path)?;
-        let mut file = BufReader::new(_file);
+        let mut file = BufReader::new(File::open(path)?);
 
         let mut header = [0u8; HEADER_SIZE];
         file.read_exact(&mut header)?;
@@ -143,7 +137,6 @@ impl<'a> Dictionary<'a> {
             ));
         }
 
-        let _version = u16::from_le_bytes([header[4], header[5]]);
         let matrix_size = u16::from_le_bytes([header[6], header[7]]) as usize;
         let num_entries =
             u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
@@ -183,8 +176,6 @@ impl<'a> Dictionary<'a> {
             index.insert(ch, (byte_offset, count));
         }
 
-        // Create zeekstd decoder for the compressed block (entries + strings)
-        // Everything after the index is compressed
         let compressed_start = file.stream_position()?;
         let offset_file = OffsetFile::new(file, compressed_start)?;
         let decoder = Decoder::new(offset_file).map_err(|e| {
@@ -193,11 +184,9 @@ impl<'a> Dictionary<'a> {
                 format!("zeekstd error: {:?}", e),
             )
         })?;
-        let entry_offset = 0; // Entries start at offset 0 in decompressed stream
 
         Ok(Dictionary {
             decoder,
-            entry_offset,
             strings_offset,
             num_entries,
             index,
@@ -210,23 +199,21 @@ impl<'a> Dictionary<'a> {
     fn lookup(&mut self, text: &str, start: usize) -> Vec<(char, usize)> {
         let chars: Vec<char> = text.chars().collect();
         if start >= chars.len() {
-            return Vec::with_capacity(1024);
+            return Vec::with_capacity(DEFAULT_CAPACITY);
         }
 
         let first_char = chars[start];
-        let mut matches = Vec::with_capacity(1024);
+        let mut matches = Vec::with_capacity(DEFAULT_CAPACITY);
 
         if !self.index.contains_key(&first_char) {
             return matches;
         }
 
-        // Check cache, bulk-read if not cached
         if !self.entry_cache.contains_key(&first_char) {
             let entries = self.bulk_read_entries(first_char);
             self.entry_cache.insert(first_char, entries);
         }
 
-        // Scan cached entries
         let cached_entries = &self.entry_cache[&first_char];
 
         for (i, entry) in cached_entries.iter().enumerate() {
@@ -254,7 +241,7 @@ fn build_lattice<'a>(
 ) -> (Vec<Vec<((char, usize), usize)>>, Vec<char>) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
-    let mut lattice = vec![Vec::with_capacity(1024); len + 1];
+    let mut lattice = vec![Vec::with_capacity(DEFAULT_CAPACITY); len + 1];
 
     for start in 0..len {
         let matches = dict.lookup(text, start);
@@ -276,7 +263,7 @@ pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
     let (lattice, chars) = build_lattice(text, dict);
     let len = chars.len();
 
-    let mut nodes: Vec<Vec<LatticeNode>> = vec![Vec::with_capacity(1024); len + 1];
+    let mut nodes: Vec<Vec<LatticeNode>> = vec![Vec::with_capacity(DEFAULT_CAPACITY); len + 1];
     let bos_node = LatticeNode {
         start_pos: 0,
         end_pos: 0,
@@ -344,17 +331,14 @@ pub fn transliterate<'a>(text: &str, dict: &mut Dictionary<'a>) -> String {
         }
     }
 
-    let mut result = Vec::with_capacity(1024);
+    let mut result = Vec::with_capacity(DEFAULT_CAPACITY);
     if nodes[len].is_empty() {
         return text.to_string();
     }
 
-    if let Some(last_node) = nodes[len].iter().min_by_key(|n| n.cost) {
+    if let Some((current_node_idx, _)) = nodes[len].iter().enumerate().min_by_key(|(_, n)| n.cost) {
         let mut current_pos = len;
-        let mut current_node_idx = nodes[len]
-            .iter()
-            .position(|n| n.cost == last_node.cost)
-            .unwrap();
+        let mut current_node_idx = current_node_idx;
 
         while current_pos > 0 {
             let node = &nodes[current_pos][current_node_idx];
