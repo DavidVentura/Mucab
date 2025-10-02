@@ -1,4 +1,4 @@
-use encoding_rs::EUC_JP;
+use encoding_rs::{EUC_JP, UTF_8};
 use glob::glob;
 use regex::Regex;
 use std::collections::HashMap;
@@ -13,18 +13,29 @@ const INDEX_ENTRY_SIZE: u32 = 10;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <input_dir> <output_dir>", args[0]);
+    if args.len() != 4 {
+        eprintln!(
+            "Usage: {} --ipadic|--unidic <input_dir> <output_dir>",
+            args[0]
+        );
         std::process::exit(1);
     }
 
-    let input_dir = &args[1];
-    let output_dir = &args[2];
+    let mode = match args[1].as_str() {
+        "--ipadic" => Mode::Ipadic,
+        "--unidic" => Mode::Unidic,
+        _ => {
+            eprintln!("mode must be either of --ipadic or --unidic");
+            std::process::exit(1);
+        }
+    };
+    let input_dir = &args[2];
+    let output_dir = &args[3];
 
     std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
 
     println!("Processing CSV files from {}...", input_dir);
-    let (pos_id_map, entries) = process_csv_files(input_dir);
+    let (pos_id_map, entries) = process_csv_files(input_dir, mode);
     println!("Found {} unique pos_ids", pos_id_map.len());
     println!("Processed {} entries", entries.len());
 
@@ -39,6 +50,7 @@ fn main() {
         matrix_data.len(),
         matrix_data.len() * 2
     );
+    println!("{:?}", matrix_data[0]);
 
     let output_path = format!("{}/mucab.bin", output_dir);
     write_binary(&output_path, &entries, &matrix_data, matrix_size as u16)
@@ -55,12 +67,22 @@ struct Entry {
     reading: String,
 }
 
-fn process_csv_files(input_dir: &str) -> (HashMap<i16, u16>, Vec<Entry>) {
+enum Mode {
+    Ipadic,
+    Unidic,
+}
+
+fn process_csv_files(input_dir: &str, mode: Mode) -> (HashMap<i16, u16>, Vec<Entry>) {
     let pattern = format!("{}/*.csv", input_dir);
     let han_regex = Regex::new(r"^\p{Han}+").unwrap();
 
     let mut pos_id_map: HashMap<i16, u16> = HashMap::new();
     let mut entries = Vec::new();
+
+    let (surface_idx, left_idx, right_idx, cost_idx, reading_idx, encoding) = match mode {
+        Mode::Ipadic => (0, 1, 2, 3, 12, EUC_JP),
+        Mode::Unidic => (0, 1, 2, 3, 13, UTF_8),
+    };
 
     for entry in glob(&pattern).expect("Failed to read glob pattern") {
         match entry {
@@ -74,19 +96,14 @@ fn process_csv_files(input_dir: &str) -> (HashMap<i16, u16>, Vec<Entry>) {
                     .read_to_end(&mut buffer)
                     .expect("Failed to read file");
 
-                let (decoded, _, had_errors) = EUC_JP.decode(&buffer);
+                let (decoded, _, had_errors) = encoding.decode(&buffer);
                 if had_errors {
                     eprintln!("Warning: encoding errors in {:?}", path);
                 }
 
                 for line in decoded.lines() {
                     let parts: Vec<&str> = line.split(',').collect();
-                    if parts.len() < 13 {
-                        continue;
-                    }
-
-                    let surface = parts[0];
-
+                    let surface = parts[surface_idx];
                     if !han_regex.is_match(surface) {
                         continue;
                     }
@@ -96,24 +113,31 @@ fn process_csv_files(input_dir: &str) -> (HashMap<i16, u16>, Vec<Entry>) {
                         continue;
                     }
 
-                    let left_id_str = parts[1];
-                    let right_id_str = parts[2];
+                    let left_id_str = parts[left_idx];
+                    let right_id_str = parts[right_idx];
                     assert_eq!(
                         left_id_str, right_id_str,
                         "left_id and right_id differ for surface: {}",
                         surface
                     );
 
-                    let cost: i32 = parts[3].parse().unwrap_or(0);
+                    let cost: i32 = parts[cost_idx].parse().unwrap();
                     if cost < i16::MIN as i32 || cost > i16::MAX as i32 {
                         eprintln!("Warning: cost out of range ({}), skipping", cost);
                         continue;
                     }
                     let cost = cost as i16;
 
-                    let reading = parts[12].to_string();
+                    let reading = parts[reading_idx].to_string();
+                    if reading.len() == 0 {
+                        eprintln!("Warning: reading empty, skipping: {}", surface);
+                    }
                     if reading.len() > 255 {
                         eprintln!("Warning: reading too long ({}), skipping", reading.len());
+                        continue;
+                    }
+                    if reading == surface {
+                        eprintln!("Warning: reading == surface ({}), skipping", reading);
                         continue;
                     }
 
@@ -307,9 +331,8 @@ fn write_binary(
         .compression_level(9)
         .frame_size_policy(FrameSizePolicy::Uncompressed(1024 * 128));
 
-    let mut encoder = Encoder::with_opts(writer, opts).map_err(|e| {
-        std::io::Error::other(format!("zeekstd error: {:?}", e))
-    })?;
+    let mut encoder = Encoder::with_opts(writer, opts)
+        .map_err(|e| std::io::Error::other(format!("zeekstd error: {:?}", e)))?;
 
     for (surf_bytes, read_off, read_len, pos_id, cost) in &entry_records {
         encoder.write_all(&[surf_bytes.len() as u8])?;
@@ -323,9 +346,9 @@ fn write_binary(
     // Write strings immediately after entries in same compressed block
     encoder.write_all(&strings_data)?;
 
-    let compressed_size = encoder.finish().map_err(|e| {
-        std::io::Error::other(format!("zeekstd error: {:?}", e))
-    })?;
+    let compressed_size = encoder
+        .finish()
+        .map_err(|e| std::io::Error::other(format!("zeekstd error: {:?}", e)))?;
     println!(
         "Compressed block: {} bytes (from {} bytes uncompressed, {:.1}% of original)",
         compressed_size,

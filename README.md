@@ -1,6 +1,6 @@
 # Mucab
 
-Mucab (µcab) takes [Mecab](https://en.wikipedia.org/wiki/MeCab) data (at least `mecab-ipadic-2.7.0-20070801`), and compacts it. It operates on the compacted data:
+Mucab (µcab) takes [Mecab](https://en.wikipedia.org/wiki/MeCab) data (at least `mecab-ipadic-2.7.0-20070801` and `unidic-mecab-2.1.2`), and compacts it. It operates on the compacted data:
 
 ```
 Input:  うわー、それは素晴らしいです
